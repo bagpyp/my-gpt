@@ -12,6 +12,8 @@ learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 32
+n_layer = 3
+dropout = 0.2
 # -------------
 
 with open("tinyshakespeare.txt", encoding="utf-8") as file:
@@ -60,25 +62,6 @@ def estimate_loss():
     return out
 
 
-class BatchNorm1d:
-
-    def __init__(self, dim, eps=1e-5, momentum=0.1):
-        self.eps = eps
-        self.gamma = torch.ones(dim)
-        self.beta = torch.zeros(dim)
-
-    def __call__(self, x):
-        # calculate the forward pass
-        xmean = x.mean(1, keepdim=True)  # batch mean
-        xvar = x.var(1, keepdim=True)  # batch variance
-        xhat = (x - xmean) / torch.sqrt(xvar + self.eps)  # normalize to unit variance
-        self.out = self.gamma * xhat + self.beta
-        return self.out
-
-    def parameters(self):
-        return [self.gamma, self.beta]
-
-
 class Head(nn.Module):
     """ one head of self attention """
 
@@ -89,6 +72,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)  # (B,T,C)
@@ -97,6 +82,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B,T,C) @ (B,C,T) -> (B,T,T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         v = self.value(x)  # (B,T,C)
         out = wei @ v  # (B,T,T) @ (B,T,C) --> (B,T,C)
         return out
@@ -109,10 +95,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(num_heads * head_size, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 
@@ -125,7 +112,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
-
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -160,12 +147,8 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            nn.LayerNorm(n_embd)
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_embd) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -175,8 +158,9 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
-        x = self.blocks(x)
-        logits = self.lm_head(x)  # (B,T,vocab_size
+        x = self.blocks(x)  # (B,T,C)
+        x = self.ln_f(x)  # (B,T,C)
+        logits = self.lm_head(x)  # (B,T,vocab_size)
 
         if targets is None:
             loss = None
